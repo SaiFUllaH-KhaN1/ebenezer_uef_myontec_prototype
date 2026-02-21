@@ -10,4 +10,4 @@ COPY . /app
 EXPOSE 9090
 
 # host_port : container_port
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "9090"]
+CMD ["streamlit", "streamlit_server:app", "--host", "0.0.0.0", "--port", "9090"]
