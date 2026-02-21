@@ -23,6 +23,22 @@ The uploaded file must contain these columns:
 
 It must also include `Time` and `Elapsed time` columns.
 
+## How To Use
+
+1. Set the sampling rate in the sidebar (default: `25 Hz`).
+2. Upload a Myontec CSV file.
+3. Review the timeline plot, phase table, and break table.
+4. Download `phases.csv` and `breaks.csv` from the app.
+
+### Note on how to use:
+The program expect the uploaded file in CSV format, NOT xlsx.
+The CSV file should be of same structure as the structure of following csv file : [click here to view](https://studentuef-my.sharepoint.com/:x:/g/personal/haataja_uef_fi/IQD3bIrbbtn7TZDRVJtNHvlrAc-q-ZtLzEP--MAJ1b3xS0E?e=ru5MQM)
+
+This file is related to the ***MaxVO2 sample*** provided and the prototype expects to have all the files having same structure and format.
+
+
+# For Developers only:
+#### (Rest of instructions related to technical work)
 ## Getting Started
 
 1. Create and activate a virtual environment.
@@ -56,13 +72,6 @@ streamlit run streamlit_server.py
 ```
 
 4. Open the local URL shown in the terminal (typically `http://localhost:8501`).
-
-## How To Use
-
-1. Set the sampling rate in the sidebar (default: `25 Hz`).
-2. Upload a Myontec CSV file.
-3. Review the timeline plot, phase table, and break table.
-4. Download `phases.csv` and `breaks.csv` from the app.
 
 ## Main Dependencies
 
