@@ -41,9 +41,13 @@ source .venv/bin/activate
 
 2. Install dependencies.
 
-```bash
-pip install -r requirements.txt
-```
+We are using pip-tools now for managing dependencies. To modify the project’s dependencies:
+
+Edit the requirements.in file to add or modify packages. So just add names of the packages without any
+versions. Then, 
+Run pip-compile to generate the requirements.txt file with the exact package versions.
+Use pip-sync to install the dependencies as specified in requirements.txt.
+This approach will save us  **MIGRAINE** across all environments.
 
 3. Run the Streamlit app.
 
