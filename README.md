@@ -52,7 +52,7 @@ This approach will save us  **MIGRAINE** across all environments.
 3. Run the Streamlit app.
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_server.py
 ```
 
 4. Open the local URL shown in the terminal (typically `http://localhost:8501`).
