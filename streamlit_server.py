@@ -6,17 +6,16 @@ import plotly.graph_objects as go
 from typing import Any
 
 
-
-# -----------------------------------------------------------------------------
-# FIXED PARAMS 
-# -----------------------------------------------------------------------------
-DEFAULT_FS_HZ = 25.0  # default sampling rate 
+# =============================================================================
+# FIXED PARAMS
+# =============================================================================
+DEFAULT_FS_HZ = 25.0
 
 # Envelope
-RMS_WIN_SEC = 1.0  # compute_emg_intensity(..., win_sec=1.0)
+RMS_WIN_SEC = 1.0
 
 # Segmentation
-SMOOTH_SEC = 2.0  # I_s = smooth_ma(I, win=int(round(2.0*fs)))
+SMOOTH_SEC = 10.0
 LOW_THR = 0.06
 MIN_BREAK_SEC = 3.0
 MERGE_GAP_SEC = 8.0
@@ -31,15 +30,17 @@ MAIN_THR = 0.75
 MAIN_HOLD_SEC = 30.0
 
 # Cleanup
-MIN_PHASE_SEC = 5.0          # clip_phases_around_breaks(..., min_phase_sec=5.0)
-SNAP_TOL_SEC = 1.0           # snap_phases_to_breaks_strict(..., tol_sec=1.0)
+MIN_PHASE_SEC = 5.0
+SNAP_TOL_SEC = 1.0
+
+EPS = 1e-9
+PHASE_LABELS = ["warmup", "aerobic", "anaerobic", "main_test", "cooldown"]
 
 
 # =============================================================================
-# 1) Robust Myontec CSV loader (from uploaded bytes)
+# 1) CSV loader 
 # =============================================================================
 def _is_number_like(s: str) -> bool:
-    """Return True if string looks like a number (supports comma decimals)."""
     s = str(s).strip() if s else ""
     if not s:
         return False
@@ -64,18 +65,9 @@ def _detect_delimiter(header_line: str) -> str:
 
 
 def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
-    """
-    Load session CSV that may include:
-      - metadata lines mixed with data
-      - comma decimals (e.g., 0,04)
-      - separators: ';' or '\\t', and sometimes ','
-
-    We only keep rows where the 2nd column ("Elapsed time") is numeric.
-    """
     text = data.decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
-    # Find header line
     header_idx = None
     for i, ln in enumerate(lines):
         if ln.strip().startswith("Time") and "Elapsed time" in ln:
@@ -89,14 +81,13 @@ def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
     header = header_line.split(sep)
 
     data_rows = []
-    for ln in lines[header_idx + 1 :]:
+    for ln in lines[header_idx + 1:]:
         if not ln.strip():
             continue
         parts = ln.split(sep)
         if len(parts) < 2:
             continue
-
-        if not _is_number_like(parts[1]):  # elapsed time must be numeric
+        if not _is_number_like(parts[1]):
             continue
 
         if len(parts) < len(header):
@@ -110,12 +101,10 @@ def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
 
     df = pd.DataFrame(data_rows, columns=header)
 
-    # elapsed time → float seconds
     df["elapsed_s"] = (
         df["Elapsed time"].astype(str).str.strip().str.replace(",", ".", regex=False).astype(float)
     )
 
-    # numeric columns (comma -> dot)
     for c in df.columns:
         if c in ("Time", "Elapsed time", "elapsed_s"):
             continue
@@ -128,10 +117,9 @@ def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
 
 
 # =============================================================================
-# 2) EMG intensity envelope (your logic)
+# 2) EMG intensity envelope
 # =============================================================================
 def moving_rms(x: np.ndarray, win: int) -> np.ndarray:
-    """Sliding RMS envelope with window 'win' samples."""
     x = np.asarray(x, dtype=np.float32)
     win = max(1, int(win))
     pad = win // 2
@@ -143,7 +131,6 @@ def moving_rms(x: np.ndarray, win: int) -> np.ndarray:
 
 
 def robust_norm01(x: np.ndarray, lo_q: int = 5, hi_q: int = 95) -> np.ndarray:
-    """Robust normalize to [0,1] using percentiles."""
     x = np.asarray(x, dtype=np.float32)
     if x.size == 0:
         return x
@@ -153,9 +140,6 @@ def robust_norm01(x: np.ndarray, lo_q: int = 5, hi_q: int = 95) -> np.ndarray:
 
 
 def compute_emg_intensity(df: pd.DataFrame, fs: float, win_sec: float):
-    """
-    Per-channel EMG RMS envelopes + combined intensity (mean across channels, norm [0,1]).
-    """
     emg_cols = [
         "Left Quadriceps Group / uV",
         "Right Quadriceps Group / uV",
@@ -175,6 +159,7 @@ def compute_emg_intensity(df: pd.DataFrame, fs: float, win_sec: float):
     for c in emg_cols:
         x = df[c].to_numpy(dtype=np.float32)
 
+        # Fill NaNs with per-channel median
         if np.isfinite(x).any():
             fill = float(np.nanmedian(x[np.isfinite(x)]))
         else:
@@ -191,7 +176,7 @@ def compute_emg_intensity(df: pd.DataFrame, fs: float, win_sec: float):
 
 
 # =============================================================================
-# 3) Segmentation helpers 
+# 3) Segmentation helpers
 # =============================================================================
 def smooth_ma(x: np.ndarray, win: int) -> np.ndarray:
     win = max(3, int(win))
@@ -212,7 +197,12 @@ def find_regions(mask: np.ndarray) -> list[tuple[int, int]]:
     return regions
 
 
-def merge_nearby_regions(regions: list[tuple[int, int]], fs: float, gap_sec: float = 8.0, min_len_sec: float = 0.0) -> list[tuple[int, int]]:
+def merge_nearby_regions(
+    regions: list[tuple[int, int]],
+    fs: float,
+    gap_sec: float = 8.0,
+    min_len_sec: float = 0.0
+) -> list[tuple[int, int]]:
     if not regions:
         return []
     gap = int(round(gap_sec * fs))
@@ -232,7 +222,12 @@ def merge_nearby_regions(regions: list[tuple[int, int]], fs: float, gap_sec: flo
     return merged
 
 
-def clip_phases_around_breaks(phases: list[dict[str, Any]], breaks: list[tuple[int, int]], fs: float, min_phase_sec: float = 5.0) -> list[dict[str, Any]]:
+def clip_phases_around_breaks(
+    phases: list[dict[str, Any]],
+    breaks: list[tuple[int, int]],
+    fs: float,
+    min_phase_sec: float = 5.0
+) -> list[dict[str, Any]]:
     if not phases:
         return []
     breaks = sorted(breaks, key=lambda x: x[0])
@@ -269,7 +264,13 @@ def clip_phases_around_breaks(phases: list[dict[str, Any]], breaks: list[tuple[i
     return clipped
 
 
-def snap_phases_to_breaks_strict(phases: list[dict[str, Any]], breaks: list[tuple[int, int]], fs: float, tol_sec: float = 0.2, warmup_label: str = "warmup") -> list[dict[str, Any]]:
+def snap_phases_to_breaks_strict(
+    phases: list[dict[str, Any]],
+    breaks: list[tuple[int, int]],
+    fs: float,
+    tol_sec: float = 0.2,
+    warmup_label: str = "warmup"
+) -> list[dict[str, Any]]:
     if not phases or not breaks:
         return phases
 
@@ -309,10 +310,7 @@ def attach_times_to_phases(phases: list[dict[str, Any]], t: np.ndarray, fs: floa
 
         t0 = float(t[i0])
         t1_last = float(t[i1 - 1])
-        if i1 < n:
-            t1 = float(t[i1])
-        else:
-            t1 = float(t1_last + (1.0 / fs))
+        t1 = float(t[i1]) if i1 < n else float(t1_last + (1.0 / fs))  # end-exclusive boundary
 
         out.append({**p, "t0": t0, "t1": t1, "t1_last": t1_last})
 
@@ -331,21 +329,85 @@ def attach_times_to_breaks(breaks: list[tuple[int, int]], t: np.ndarray, fs: flo
 
         t0 = float(t[b0])
         t1_last = float(t[b1 - 1])
-        if b1 < n:
-            t1 = float(t[b1])
-        else:
-            t1 = float(t1_last + (1.0 / fs))
+        t1 = float(t[b1]) if b1 < n else float(t1_last + (1.0 / fs))  # end-exclusive boundary
 
         out.append({"i0": b0, "i1": b1, "t0": t0, "t1": t1, "t1_last": t1_last})
 
     return out
 
 
-def segment_phases_from_emg(t: np.ndarray, I: np.ndarray, fs: float = 25.0) -> tuple[list[dict[str, Any]], list[tuple[int, int]], np.ndarray]:
+def phase_time_defaults(phases_t: list[dict[str, Any]]) -> dict[str, dict[str, float | bool]]:
+    defaults = {
+        label: {"enabled": False, "t0": 0.0, "t1": 0.0}
+        for label in PHASE_LABELS
+    }
+    for p in phases_t:
+        label = str(p["label"])
+        if label not in defaults:
+            continue
+        defaults[label] = {
+            "enabled": True,
+            "t0": round(float(p["t0"]), 2),
+            "t1": round(float(p["t1"]), 2),
+        }
+    return defaults
+
+
+def build_manual_phases(
+    t: np.ndarray,
+    fs: float,
+    manual_specs: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    t = np.asarray(t, dtype=np.float32)
+    n = len(t)
+    if n == 0:
+        return [], ["No time axis is available for manual phase boundaries."]
+
+    time_max = float(t[-1] + (1.0 / fs))
+    phases = []
+    errors = []
+
+    for spec in manual_specs:
+        label = str(spec["label"])
+        if not bool(spec.get("enabled", False)):
+            continue
+
+        t0 = float(np.clip(spec.get("t0", 0.0), 0.0, time_max))
+        t1 = float(np.clip(spec.get("t1", 0.0), 0.0, time_max))
+        if t1 <= t0:
+            errors.append(f"{label}: end time must be greater than start time.")
+            continue
+
+        i0 = int(np.searchsorted(t, t0, side="left"))
+        i1 = int(np.searchsorted(t, t1, side="left"))
+        i1 = min(i1, n)
+
+        if i0 >= n or i1 <= i0:
+            errors.append(f"{label}: selected range does not map to a valid sample interval.")
+            continue
+
+        phases.append({"label": label, "i0": i0, "i1": i1})
+
+    phases.sort(key=lambda p: (int(p["i0"]), PHASE_LABELS.index(str(p["label"])) if str(p["label"]) in PHASE_LABELS else 999))
+
+    for prev, curr in zip(phases, phases[1:]):
+        if int(prev["i1"]) > int(curr["i0"]):
+            errors.append(
+                f"{prev['label']} overlaps {curr['label']}. Manual phases must not overlap."
+            )
+
+    return phases, errors
+
+
+def segment_phases_from_emg(
+    t: np.ndarray,
+    I: np.ndarray,
+    fs: float = 25.0
+) -> tuple[list[dict[str, Any]], list[tuple[int, int]], np.ndarray]:
     t = np.asarray(t, dtype=np.float32)
     I = np.asarray(I, dtype=np.float32)
 
-    I_s = smooth_ma(I, win=int(round(SMOOTH_SEC * fs)))  # 2s smoothing
+    I_s = smooth_ma(I, win=int(round(SMOOTH_SEC * fs)))
 
     # A) Breaks
     low_mask = I_s < LOW_THR
@@ -382,7 +444,7 @@ def segment_phases_from_emg(t: np.ndarray, I: np.ndarray, fs: float = 25.0) -> t
 
         true_start = aw
         for i in range(0, max(0, len(above) - hold_len)):
-            if above[i : i + hold_len].all():
+            if above[i: i + hold_len].all():
                 true_start = aw + i
                 break
 
@@ -401,7 +463,7 @@ def segment_phases_from_emg(t: np.ndarray, I: np.ndarray, fs: float = 25.0) -> t
 
     split_i = None
     for i in range(0, max(0, len(above) - hold_len)):
-        if above[i : i + hold_len].all():
+        if above[i: i + hold_len].all():
             split_i = am + i
             break
 
@@ -416,14 +478,13 @@ def segment_phases_from_emg(t: np.ndarray, I: np.ndarray, fs: float = 25.0) -> t
 
 
 # =============================================================================
-# 4) Plotly figures
+# 4) Plotly figures 
 # =============================================================================
 def build_timeline_figure(t: np.ndarray, I: np.ndarray, I_s: np.ndarray, phases_t: list[dict[str, Any]], breaks_t: list[dict[str, Any]]) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=t, y=I, mode="lines", name="EMG intensity (norm)", opacity=0.25))
     fig.add_trace(go.Scatter(x=t, y=I_s, mode="lines", name="EMG intensity (smoothed)", line=dict(width=3)))
 
-    # Breaks shaded
     for j, b in enumerate(breaks_t):
         fig.add_vrect(
             x0=b["t0"], x1=b["t1"],
@@ -433,7 +494,6 @@ def build_timeline_figure(t: np.ndarray, I: np.ndarray, I_s: np.ndarray, phases_
             annotation_position="top left",
         )
 
-    # Phase bands
     phase_fill = {
         "warmup": "rgba(0, 200, 255, 0.10)",
         "aerobic": "rgba(0, 255, 150, 0.10)",
@@ -482,7 +542,100 @@ def build_env_figure(t: np.ndarray, emg_env_df: pd.DataFrame, selected: list[str
 
 
 # =============================================================================
-# 5) Streamlit UI
+# 5) Compute Load Metrics
+# =============================================================================
+def compute_myontec_load_signals(emg_env_df: pd.DataFrame, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Implements load calculations based on the ENVELOPE channels (uV-like).
+
+    Inputs:
+      - emg_env_df: DataFrame with 6 envelope channels (uV-like)
+      - fs: sampling rate (Hz)
+
+    Outputs:
+      - muscle_load: momentary muscle activity, per-sample (NaN for first ~1s)
+      - sum_all_channels_x_dt: per-sample sum across channels of (VALUE * dt)
+    """
+    dt = 1.0 / float(fs)
+    X = emg_env_df.to_numpy(dtype=np.float64)  # shape (N, CH)
+    n, ch = X.shape
+
+    # Per-sample contribution to Total Muscle Load numerator:
+    # sum_ch( VALUE_ch,s * dt )
+    sum_all_channels_x_dt = np.sum(X * dt, axis=1)  # shape (N,)
+
+    # Muscle Load (momentary): sliding 1-second window AUC summed over channels, scaled by 0.6
+    # window length in samples = fs (1 second)
+    w = int(round(fs))
+    if w < 1:
+        w = 1
+
+    # Compute sliding window sum for each channel, then sum channels.
+    muscle_load = np.full(n, np.nan, dtype=np.float64)
+    if n >= w:
+        kernel = np.ones(w, dtype=np.float64)
+        window_sum_all = np.zeros(n, dtype=np.float64)
+        for j in range(ch):
+            window_sum = np.convolve(X[:, j], kernel, mode="same")
+            window_sum_all += window_sum
+
+        # edges include partial windows for "same" convolution.
+        # therefore we blank out the first w samples
+        # so min/max are computed on stable full windows only.
+        window_auc_all = window_sum_all * dt
+        muscle_load[:] = window_auc_all * 0.6
+        muscle_load[:w] = np.nan
+
+    return muscle_load, sum_all_channels_x_dt
+
+
+def phases_table_with_loads(
+    phases_t: list[dict[str, Any]],
+    muscle_load: np.ndarray,
+    sum_all_channels_x_dt: np.ndarray,
+    fs: float
+) -> pd.DataFrame:
+    """
+    Returns a DataFrame with one row per phase, containing the following columns:
+      label, t_start, t_end, min load, p5, max load, p95, total load
+
+    Definitions:
+      - min/max load: min/max of 'Muscle Load' within [i0, i1), ignoring NaNs
+      - p5/p95: 5th/95th percentile of 'Muscle Load' within [i0, i1), ignoring NaNs
+      - total load: Total Muscle Load within [i0, i1) = sum(sum_all_channels_x_dt) / 100
+    """
+    rows = []
+    for p in phases_t:
+        label = str(p["label"])
+        i0, i1 = int(p["i0"]), int(p["i1"])
+
+        seg_ml = muscle_load[i0:i1]
+        seg_contrib = sum_all_channels_x_dt[i0:i1]
+
+        # min/max on stable values only
+        seg_ml_f = seg_ml[np.isfinite(seg_ml)]
+        min_load = float(np.min(seg_ml_f)) if seg_ml_f.size else np.nan
+        p5_load = float(np.percentile(seg_ml_f, 5)) if seg_ml_f.size else np.nan
+        max_load = float(np.max(seg_ml_f)) if seg_ml_f.size else np.nan
+        p95_load = float(np.percentile(seg_ml_f, 95)) if seg_ml_f.size else np.nan
+
+        total_load = float(np.sum(seg_contrib) / 100.0) if np.isfinite(seg_contrib).any() else np.nan
+
+        rows.append({
+            "label": label,
+            "t_start": round(float(p["t0"]), 2),
+            "t_end": round(float(p["t1"]), 2),
+            "min load": min_load,
+            "p5": p5_load,
+            "max load": max_load,
+            "p95": p95_load,
+            "total load": total_load,
+        })
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 6) Streamlit UI
 # =============================================================================
 st.set_page_config(page_title="Myontec EMG Segmentation Analysis Dashboard", layout="wide")
 
@@ -496,6 +649,13 @@ st.markdown(
         border: 1px solid rgba(255,255,255,0.08);
       }
       .muted { opacity: 0.75; }
+      .js-plotly-plot .plotly .modebar-btn {
+        padding: 8px 10px;
+      }
+      .js-plotly-plot .plotly .modebar-btn svg {
+        width: 20px;
+        height: 20px;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -511,7 +671,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar: ONLY sampling rate control
 st.sidebar.header("Controls")
 fs = st.sidebar.number_input("Sampling rate (Hz)", min_value=1.0, max_value=500.0, value=DEFAULT_FS_HZ, step=1.0)
 
@@ -534,35 +693,71 @@ except (ValueError, KeyError) as e:
     st.error(f"Failed to compute EMG intensity: {e}")
     st.stop()
 
+duration_s = float(t[-1]) if len(t) else 0.0
+time_max = float(t[-1] + (1.0 / fs)) if len(t) else 0.0
+
 # Segment phases
-phases, breaks, I_s = segment_phases_from_emg(t, emg_intensity, fs=fs)
+auto_phases, breaks, I_s = segment_phases_from_emg(t, emg_intensity, fs=fs)
 
-# Clip + snap 
-phases = clip_phases_around_breaks(phases, breaks, fs=fs, min_phase_sec=MIN_PHASE_SEC)
-phases = snap_phases_to_breaks_strict(phases, breaks, fs=fs, tol_sec=SNAP_TOL_SEC)
+# Clip + snap
+auto_phases = clip_phases_around_breaks(auto_phases, breaks, fs=fs, min_phase_sec=MIN_PHASE_SEC)
+auto_phases = snap_phases_to_breaks_strict(auto_phases, breaks, fs=fs, tol_sec=SNAP_TOL_SEC)
 
-# Attach boundary times (end-exclusive)
-phases_t = attach_times_to_phases(phases, t, fs=fs)
+# Attach times
+auto_phases_t = attach_times_to_phases(auto_phases, t, fs=fs)
 breaks_t = attach_times_to_breaks(breaks, t, fs=fs)
 
-# Tables
-def phases_table(phases_t: list[dict[str, Any]], fs: float) -> pd.DataFrame:
-    rows = []
-    for p in phases_t:
-        dur = (int(p["i1"]) - int(p["i0"])) / fs
-        rows.append(
-            {
-                "label": p["label"],
-                "t_start": round(p["t0"], 2),
-                "t_end": round(p["t1"], 2),
-                "duration_s": round(dur, 2),
-                "i0": int(p["i0"]),
-                "i1": int(p["i1"]),
-            }
+phase_mode = st.sidebar.radio("Phase boundaries", ["Auto", "Manual"], index=0)
+phases = auto_phases
+
+if phase_mode == "Manual":
+    st.sidebar.caption("Set exact phase start and end times in seconds.")
+    defaults = phase_time_defaults(auto_phases_t)
+    manual_specs = []
+
+    for label in PHASE_LABELS:
+        default_enabled = bool(defaults[label]["enabled"])
+        enabled = st.sidebar.checkbox(
+            f"Use {label}",
+            value=default_enabled,
+            key=f"manual_phase_enabled_{label}",
         )
-    return pd.DataFrame(rows)
+        t0_default = float(defaults[label]["t0"])
+        t1_default = float(defaults[label]["t1"])
+        if enabled:
+            t0 = st.sidebar.number_input(
+                f"{label} start (s)",
+                min_value=0.0,
+                max_value=time_max,
+                value=min(t0_default, time_max),
+                step=0.5,
+                key=f"manual_phase_t0_{label}",
+            )
+            t1 = st.sidebar.number_input(
+                f"{label} end (s)",
+                min_value=0.0,
+                max_value=time_max,
+                value=min(t1_default if t1_default > 0 else time_max, time_max),
+                step=0.5,
+                key=f"manual_phase_t1_{label}",
+            )
+        else:
+            t0 = t0_default
+            t1 = t1_default
 
+        manual_specs.append({"label": label, "enabled": enabled, "t0": t0, "t1": t1})
 
+    manual_phases, manual_errors = build_manual_phases(t, fs=fs, manual_specs=manual_specs)
+    if manual_errors:
+        st.sidebar.error("Manual phase boundaries are invalid.")
+        for msg in manual_errors:
+            st.sidebar.caption(msg)
+    else:
+        phases = manual_phases
+
+phases_t = attach_times_to_phases(phases, t, fs=fs)
+
+# Breaks table 
 def breaks_table(breaks_t: list[dict[str, Any]], fs: float) -> pd.DataFrame:
     rows = []
     for b in breaks_t:
@@ -579,9 +774,14 @@ def breaks_table(breaks_t: list[dict[str, Any]], fs: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-ph_df = phases_table(phases_t, fs)
-br_df = breaks_table(breaks_t, fs)
-duration_s = float(t[-1]) if len(t) else 0.0
+# =============================================================================
+# Compute load signals using the ENVELOPES
+# =============================================================================
+muscle_load, sum_all_channels_x_dt = compute_myontec_load_signals(emg_env_df, fs=fs)
+
+# Phase table 
+ph_df = phases_table_with_loads(phases_t, muscle_load, sum_all_channels_x_dt, fs=fs)
+br_df = breaks_table(breaks_t, fs=fs)
 
 # KPI row
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -599,14 +799,9 @@ with left:
     st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("Per-channel RMS envelopes"):
-        # User selects which channel(s) to show
         options = list(emg_env_df.columns)
-        default_sel = options[:2] if len(options) >= 2 else options
-        selected = st.multiselect(
-            "Select channel(s) to display",
-            options=options,
-            default=default_sel,
-        )
+        default_sel = options
+        selected = st.multiselect("Select channel(s) to display", options=options, default=default_sel)
 
         if not selected:
             st.info("Select at least one channel to display its RMS envelope.")
@@ -614,21 +809,22 @@ with left:
             env_fig = build_env_figure(t, emg_env_df, selected)
             st.plotly_chart(env_fig, use_container_width=True)
 
+
 with right:
-    st.subheader("Detected Phases")
+    st.subheader("Detected Phases (Load Summary)")
     st.dataframe(ph_df, use_container_width=True, height=240)
     st.download_button(
-        "Download phases.csv",
+        "Download phases_loads.csv",
         data=ph_df.to_csv(index=False).encode("utf-8"),
-        file_name="phases.csv",
+        file_name="phases_loads.csv",
         mime="text/csv",
     )
 
-    st.subheader("Detected Breaks / Dropouts")
-    st.dataframe(br_df, use_container_width=True, height=240)
-    st.download_button(
-        "Download breaks.csv",
-        data=br_df.to_csv(index=False).encode("utf-8"),
-        file_name="breaks.csv",
-        mime="text/csv",
-    )
+    # st.subheader("Detected Breaks / Dropouts")
+    # st.dataframe(br_df, use_container_width=True, height=240)
+    # st.download_button(
+    #     "Download breaks.csv",
+    #     data=br_df.to_csv(index=False).encode("utf-8"),
+    #     file_name="breaks.csv",
+    #     mime="text/csv",
+    # )
