@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -35,6 +36,64 @@ SNAP_TOL_SEC = 1.0
 
 EPS = 1e-9
 PHASE_LABELS = ["warmup", "aerobic", "anaerobic", "main_test", "cooldown"]
+EXERCISE_OPTIONS = ["Exercise 1", "Exercise 2"]
+EX2_ACTIVE_THR = 0.30
+EX2_BREAK_THR = 0.12
+EX2_MIN_BREAK_SEC = 5.0
+EX2_ACTIVE_GAP_SEC = 8.0
+EX2_MIN_BOUT_SEC = 20.0
+EX2_COOLDOWN_MIN_SEC = 180.0
+EX2_SPRINT_CORE_THR = 0.45
+EX2_SPRINT_PAD_SEC = 2.0
+BRAND_YELLOW = "#FFDD00"
+BRAND_YELLOW_SOFT = "#FFF3A6"
+BRAND_YELLOW_PALE = "#FFF9D6"
+BRAND_BLACK = "#121212"
+BRAND_CHARCOAL = "#2A2A2A"
+BRAND_WHITE = "#FFFDF7"
+BRAND_PANEL = "#FFF7CC"
+BRAND_GRID = "#E6D98B"
+BRAND_BREAK = "rgba(18, 18, 18, 0.08)"
+EXERCISE_CHANNELS = {
+    "Exercise 1": [
+        "Left Quadriceps Group / uV",
+        "Right Quadriceps Group / uV",
+        "Left Hamstrings / uV",
+        "Right Hamstrings / uV",
+        "Left Gluteus / uV",
+        "Right Gluteus / uV",
+    ],
+    "Exercise 2": [
+        "Left Trapezius / uV",
+        "Right Trapezius / uV",
+        "Left Pectoralis / uV",
+        "Right Pectoralis / uV",
+        "Left Latissimus dorsi / uV",
+        "Right Latissimus dorsi / uV",
+        "Left Deltoids / uV",
+        "Left Triceps / uV",
+        "Left Biceps / uV",
+        "Left Wrist extensors / uV",
+        "Left Wrist flexors / uV",
+        "Right Deltoids / uV",
+        "Right Triceps / uV",
+        "Right Biceps / uV",
+        "Right Wrist extensors / uV",
+        "Right Wrist flexors / uV",
+        "Left Quadriceps Group / uV",
+        "Right Quadriceps Group / uV",
+        "Left Hamstrings / uV",
+        "Right Hamstrings / uV",
+        "Left Gluteus / uV",
+        "Right Gluteus / uV",
+        "Left Gastrocnemius / uV",
+        "Left Tibialis / uV",
+        "Left Soleus / uV",
+        "Right Gastrocnemius / uV",
+        "Right Tibialis / uV",
+        "Right Soleus / uV",
+    ],
+}
 
 
 # =============================================================================
@@ -64,15 +123,63 @@ def _detect_delimiter(header_line: str) -> str:
     return best_sep
 
 
-def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
+def _clean_elapsed_time_value(s: str) -> str:
+    s = str(s).strip() if s else ""
+    if not s:
+        return ""
+
+    s = s.replace(",", ".").replace("\t", ".")
+    filtered = "".join(ch for ch in s if ch.isdigit() or ch == ".")
+
+    if filtered.count(".") > 1:
+        first_dot = filtered.find(".")
+        filtered = filtered[: first_dot + 1] + filtered[first_dot + 1 :].replace(".", "")
+
+    return filtered
+
+
+def _find_header_idx(lines: list[str]) -> int | None:
+    for i, ln in enumerate(lines):
+        normalized = ln.strip().lstrip("\ufeff")
+        if "Time" in normalized and "Elapsed time" in normalized:
+            return i
+    return None
+
+
+def _extract_sampling_rate_hz(header_line: str) -> float | None:
+    marker = "Sampling frequency:"
+    if marker not in header_line:
+        return None
+
+    tail = header_line.split(marker, 1)[1].strip()
+    token = []
+    for ch in tail:
+        if ch.isdigit() or ch == ".":
+            token.append(ch)
+        elif token:
+            break
+
+    if not token:
+        return None
+
+    try:
+        return float("".join(token))
+    except ValueError:
+        return None
+
+
+def _format_hms(total_seconds: float) -> str:
+    total_seconds = max(0, int(round(total_seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+
+def _load_myontec_csv_exercise_1(data: bytes) -> pd.DataFrame:
     text = data.decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
-    header_idx = None
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("Time") and "Elapsed time" in ln:
-            header_idx = i
-            break
+    header_idx = _find_header_idx(lines)
     if header_idx is None:
         raise ValueError("Could not find header line containing 'Time' and 'Elapsed time'.")
 
@@ -116,6 +223,94 @@ def load_myontec_csv_from_bytes(data: bytes) -> pd.DataFrame:
     return df
 
 
+def _load_myontec_csv_exercise_2(data: bytes) -> pd.DataFrame:
+    text = data.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+
+    header_idx = _find_header_idx(lines)
+    if header_idx is None:
+        raise ValueError("Could not find header line containing 'Time' and 'Elapsed time'.")
+
+    header_line = lines[header_idx]
+    sampling_rate_hz = _extract_sampling_rate_hz(header_line)
+    raw_header = header_line.split(";")
+    if "Marker" in raw_header:
+        marker_idx = raw_header.index("Marker")
+        header = raw_header[: marker_idx + 1]
+    else:
+        header = raw_header
+
+    data_rows = []
+    for ln in lines[header_idx + 1:]:
+        if not ln.strip():
+            continue
+
+        parts = ln.split(";")
+        if len(parts) < 2:
+            continue
+
+        if len(parts) < len(header):
+            parts += [""] * (len(header) - len(parts))
+        else:
+            parts = parts[: len(header)]
+
+        elapsed_clean = _clean_elapsed_time_value(parts[1])
+        if not _is_number_like(elapsed_clean):
+            continue
+        parts[1] = elapsed_clean
+
+        data_rows.append(parts)
+
+    if not data_rows:
+        raise ValueError("No data rows found after filtering. Check separator/format.")
+
+    df = pd.DataFrame(data_rows, columns=header)
+    df["elapsed_s"] = pd.to_numeric(df["Elapsed time"], errors="coerce")
+    df = df.dropna(subset=["elapsed_s"]).copy()
+
+    for c in df.columns:
+        if c in ("Time", "Elapsed time", "elapsed_s", "Marker"):
+            continue
+        s = df[c].astype(str).str.strip().str.replace(",", ".", regex=False)
+        s = s.replace({"": np.nan, "None": np.nan})
+        df[c] = pd.to_numeric(s, errors="coerce")
+
+    df = df.sort_values("elapsed_s").reset_index(drop=True)
+    if sampling_rate_hz is not None:
+        df.attrs["sampling_rate_hz"] = sampling_rate_hz
+    return df
+
+
+def load_myontec_csv_from_bytes(data: bytes, exercise_name: str = "Exercise 1") -> pd.DataFrame:
+    if exercise_name == "Exercise 1":
+        return _load_myontec_csv_exercise_1(data)
+    if exercise_name == "Exercise 2":
+        return _load_myontec_csv_exercise_2(data)
+    raise ValueError(f"Unsupported exercise: {exercise_name}")
+
+
+def load_myontec_file(uploaded_file: Any, exercise_name: str = "Exercise 1") -> pd.DataFrame:
+    name = str(getattr(uploaded_file, "name", "") or "").lower()
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            raw_df = pd.read_excel(uploaded_file, header=None, dtype=str)
+        except ImportError as e:
+            raise ValueError(f"Excel support is unavailable: {e}") from e
+        except Exception as e:
+            raise ValueError(f"Failed to read Excel file: {e}") from e
+
+        # Rebuild the sheet as delimiter-separated text so both Excel and CSV
+        # go through the same exercise-specific parsing rules.
+        lines = []
+        for row in raw_df.fillna("").itertuples(index=False, name=None):
+            lines.append(";".join(str(cell).strip() for cell in row))
+        data = "\n".join(lines).encode("utf-8")
+        return load_myontec_csv_from_bytes(data, exercise_name=exercise_name)
+
+    return load_myontec_csv_from_bytes(uploaded_file.getvalue(), exercise_name=exercise_name)
+
+
 # =============================================================================
 # 2) EMG intensity envelope
 # =============================================================================
@@ -139,15 +334,7 @@ def robust_norm01(x: np.ndarray, lo_q: int = 5, hi_q: int = 95) -> np.ndarray:
     return np.clip(y, 0.0, 1.0).astype(np.float32)
 
 
-def compute_emg_intensity(df: pd.DataFrame, fs: float, win_sec: float):
-    emg_cols = [
-        "Left Quadriceps Group / uV",
-        "Right Quadriceps Group / uV",
-        "Left Hamstrings / uV",
-        "Right Hamstrings / uV",
-        "Left Gluteus / uV",
-        "Right Gluteus / uV",
-    ]
+def compute_emg_intensity(df: pd.DataFrame, fs: float, win_sec: float, emg_cols: list[str]):
     missing = [c for c in emg_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing EMG columns: {missing}")
@@ -399,7 +586,7 @@ def build_manual_phases(
     return phases, errors
 
 
-def segment_phases_from_emg(
+def segment_phases_from_emg_exercise_1(
     t: np.ndarray,
     I: np.ndarray,
     fs: float = 25.0
@@ -477,67 +664,307 @@ def segment_phases_from_emg(
     return phases, breaks, I_s
 
 
+def _label_sequential_regions(
+    regions: list[tuple[int, int]],
+    prefix: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"label": f"{prefix}_{idx}", "i0": a, "i1": b}
+        for idx, (a, b) in enumerate(regions, start=1)
+    ]
+
+
+def _trim_region_to_core(
+    x: np.ndarray,
+    region: tuple[int, int],
+    thr: float,
+    fs: float,
+    pad_sec: float = 0.0,
+) -> tuple[int, int]:
+    a, b = region
+    if b <= a:
+        return region
+
+    seg = np.asarray(x[a:b], dtype=np.float32)
+    core_regions = find_regions(seg >= thr)
+    if not core_regions:
+        return region
+
+    ca, cb = max(core_regions, key=lambda r: r[1] - r[0])
+    pad = int(round(pad_sec * fs))
+    na = max(a, a + ca - pad)
+    nb = min(b, a + cb + pad)
+    if nb <= na:
+        return region
+    return na, nb
+
+
+def segment_phases_from_emg_exercise_2(
+    t: np.ndarray,
+    I: np.ndarray,
+    fs: float = 100.0,
+) -> tuple[list[dict[str, Any]], list[tuple[int, int]], np.ndarray]:
+    t = np.asarray(t, dtype=np.float32)
+    I = np.asarray(I, dtype=np.float32)
+
+    I_s = smooth_ma(I, win=int(round(SMOOTH_SEC * fs)))
+
+    low_regions = find_regions(I_s < EX2_BREAK_THR)
+    breaks = merge_nearby_regions(
+        low_regions,
+        fs=fs,
+        gap_sec=MERGE_GAP_SEC,
+        min_len_sec=EX2_MIN_BREAK_SEC,
+    )
+
+    active_regions = find_regions(I_s >= EX2_ACTIVE_THR)
+    active_regions = merge_nearby_regions(
+        active_regions,
+        fs=fs,
+        gap_sec=EX2_ACTIVE_GAP_SEC,
+        min_len_sec=EX2_MIN_BOUT_SEC,
+    )
+    if not active_regions:
+        return [], breaks, I_s
+
+    phases: list[dict[str, Any]] = []
+
+    warmup_region = active_regions[0]
+    phases.append({"label": "warmup", "i0": warmup_region[0], "i1": warmup_region[1]})
+
+    remaining_regions = active_regions[1:]
+    cooldown_region: tuple[int, int] | None = None
+    if remaining_regions:
+        last_region = remaining_regions[-1]
+        last_duration_sec = (last_region[1] - last_region[0]) / fs
+        starts_late = len(t) > 0 and float(t[last_region[0]]) >= (0.70 * float(t[-1]))
+        if last_duration_sec >= EX2_COOLDOWN_MIN_SEC and starts_late:
+            cooldown_region = last_region
+            remaining_regions = remaining_regions[:-1]
+
+    sprint_regions: list[tuple[int, int]] = []
+    main_regions: list[tuple[int, int]] = []
+    if remaining_regions:
+        if len(remaining_regions) == 1:
+            main_regions = remaining_regions
+        else:
+            gaps = [remaining_regions[i + 1][0] - remaining_regions[i][1] for i in range(len(remaining_regions) - 1)]
+            split_idx = int(np.argmax(gaps)) + 1
+            sprint_regions = remaining_regions[:split_idx]
+            main_regions = remaining_regions[split_idx:]
+
+            if not sprint_regions or not main_regions:
+                durations = np.asarray([b - a for (a, b) in remaining_regions], dtype=np.int32)
+                long_mask = durations >= int(round(90.0 * fs))
+                first_long = int(np.argmax(long_mask)) if long_mask.any() else max(1, len(remaining_regions) // 2)
+                sprint_regions = remaining_regions[:first_long]
+                main_regions = remaining_regions[first_long:]
+
+    sprint_regions = [
+        _trim_region_to_core(
+            I_s,
+            region,
+            thr=EX2_SPRINT_CORE_THR,
+            fs=fs,
+            pad_sec=EX2_SPRINT_PAD_SEC,
+        )
+        for region in sprint_regions
+    ]
+
+    phases.extend(_label_sequential_regions(sprint_regions, "sprint"))
+    phases.extend(_label_sequential_regions(main_regions, "main"))
+
+    if cooldown_region is not None:
+        phases.append({"label": "cooldown", "i0": cooldown_region[0], "i1": cooldown_region[1]})
+
+    phases = sorted(phases, key=lambda p: int(p["i0"]))
+    return phases, breaks, I_s
+
+
+def segment_phases_from_emg(
+    t: np.ndarray,
+    I: np.ndarray,
+    fs: float = 25.0,
+    exercise_name: str = "Exercise 1",
+) -> tuple[list[dict[str, Any]], list[tuple[int, int]], np.ndarray]:
+    if exercise_name == "Exercise 1":
+        return segment_phases_from_emg_exercise_1(t, I, fs=fs)
+    if exercise_name == "Exercise 2":
+        return segment_phases_from_emg_exercise_2(t, I, fs=fs)
+    raise ValueError(f"Unsupported exercise: {exercise_name}")
+
+
 # =============================================================================
 # 4) Plotly figures 
 # =============================================================================
-def build_timeline_figure(t: np.ndarray, I: np.ndarray, I_s: np.ndarray, phases_t: list[dict[str, Any]], breaks_t: list[dict[str, Any]]) -> go.Figure:
+def build_timeline_figure(
+    t: np.ndarray,
+    I: np.ndarray,
+    I_s: np.ndarray,
+    phases_t: list[dict[str, Any]],
+    breaks_t: list[dict[str, Any]],
+    exercise_name: str,
+) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=I, mode="lines", name="EMG intensity (norm)", opacity=0.25))
-    fig.add_trace(go.Scatter(x=t, y=I_s, mode="lines", name="EMG intensity (smoothed)", line=dict(width=3)))
+    fig.add_trace(
+        go.Scatter(
+            x=t,
+            y=I,
+            mode="lines",
+            name="EMG intensity (norm)",
+            opacity=0.35,
+            line=dict(color="rgba(255, 221, 0, 0.28)", width=1.5),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=t,
+            y=I_s,
+            mode="lines",
+            name="EMG intensity (smoothed)",
+            line=dict(color=BRAND_BLACK, width=2.5),
+        )
+    )
+    main_start_x: list[float | None] = []
+    main_start_y: list[float | None] = []
+    main_start_text: list[str | None] = []
+    main_end_x: list[float | None] = []
+    main_end_y: list[float | None] = []
+    main_end_text: list[str | None] = []
 
     for j, b in enumerate(breaks_t):
         fig.add_vrect(
             x0=b["t0"], x1=b["t1"],
-            fillcolor="rgba(255,255,255,0.08)",
+            fillcolor="rgba(0, 0, 0, 0)",
             line_width=0,
-            annotation_text="break" if j == 0 else None,
-            annotation_position="top left",
         )
 
     phase_fill = {
-        "warmup": "rgba(0, 200, 255, 0.10)",
-        "aerobic": "rgba(0, 255, 150, 0.10)",
-        "anaerobic": "rgba(255, 120, 0, 0.12)",
-        "cooldown": "rgba(180, 180, 255, 0.10)",
-        "main_test": "rgba(255, 255, 0, 0.08)",
+        "warmup": "rgba(42, 42, 42, 0.08)",
+        "aerobic": "rgba(255, 221, 0, 0.12)",
+        "anaerobic": "rgba(18, 18, 18, 0.08)",
+        "cooldown": "rgba(42, 42, 42, 0.08)",
+        "main_test": "rgba(255, 221, 0, 0.10)",
+        "sprint": "rgba(255, 221, 0, 0.10)",
+        "main": "rgba(255, 221, 0, 0.10)",
     }
 
     for p in phases_t:
-        fig.add_vrect(
-            x0=p["t0"], x1=p["t1"],
-            fillcolor=phase_fill.get(p["label"], "rgba(200,200,200,0.08)"),
-            line_width=0,
+        label = str(p["label"])
+        is_main = label.startswith("main_")
+        should_shade = False
+        fillcolor = "rgba(255, 221, 0, 0.07)"
+
+        if exercise_name == "Exercise 1":
+            if label in {"warmup", "aerobic", "anaerobic", "cooldown"}:
+                should_shade = True
+                fillcolor = phase_fill[label]
+        elif exercise_name == "Exercise 2":
+            if label in {"warmup", "cooldown"}:
+                should_shade = True
+                fillcolor = phase_fill[label]
+            elif label.startswith("sprint_"):
+                should_shade = True
+                fillcolor = phase_fill["sprint"]
+            elif is_main:
+                should_shade = True
+                fillcolor = phase_fill["main"]
+
+        if should_shade:
+            fig.add_vrect(
+                x0=p["t0"], x1=p["t1"],
+                fillcolor=fillcolor,
+                line_width=0,
+            )
+
+        if is_main:
+            main_start_x.extend([float(p["t0"]), float(p["t0"]), None])
+            main_start_y.extend([0.0, 1.2, None])
+            main_start_text.extend([f"{label} start: {float(p['t0']):.1f} s"] * 2 + [None])
+            main_end_x.extend([float(p["t1"]), float(p["t1"]), None])
+            main_end_y.extend([0.0, 1.2, None])
+            main_end_text.extend([f"{label} end: {float(p['t1']):.1f} s"] * 2 + [None])
+            fig.add_annotation(
+                x=(float(p["t0"]) + float(p["t1"])) / 2.0,
+                y=1.07,
+                text=label,
+                showarrow=False,
+                xanchor="center",
+            )
+        else:
+            fig.add_vline(x=p["t0"], line_width=1, line_dash="dash", opacity=0.6)
+            fig.add_annotation(
+                x=p["t0"], y=1.06, text=label,
+                showarrow=False, textangle=-90, xanchor="left",
+            )
+
+    if main_start_x:
+        fig.add_trace(
+            go.Scatter(
+                x=main_start_x,
+                y=main_start_y,
+                mode="lines",
+                line=dict(color="rgba(18, 18, 18, 0.28)", width=1, dash="dash"),
+                hovertext=main_start_text,
+                hovertemplate="%{hovertext}<extra></extra>",
+                showlegend=False,
+            )
         )
-        fig.add_vline(x=p["t0"], line_width=1, line_dash="dash", opacity=0.6)
-        fig.add_annotation(
-            x=p["t0"], y=1.06, text=p["label"],
-            showarrow=False, textangle=-90, xanchor="left",
+    if main_end_x:
+        fig.add_trace(
+            go.Scatter(
+                x=main_end_x,
+                y=main_end_y,
+                mode="lines",
+                line=dict(color="rgba(18, 18, 18, 0.28)", width=1, dash="dash"),
+                hovertext=main_end_text,
+                hovertemplate="%{hovertext}<extra></extra>",
+                showlegend=False,
+            )
         )
 
     fig.update_layout(
-        height=460,
-        margin=dict(l=20, r=20, t=45, b=30),
-        template="plotly_dark",
+        height=620,
+        margin=dict(l=20, r=20, t=45, b=70),
+        template="plotly_white",
+        paper_bgcolor=BRAND_WHITE,
+        plot_bgcolor=BRAND_WHITE,
+        font=dict(color=BRAND_CHARCOAL),
         xaxis_title="Time (s)",
         yaxis_title="Intensity (0..1)",
-        yaxis=dict(range=[0, 1.1]),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(range=[0.0, 1.2]),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
     )
+    fig.update_xaxes(showgrid=True, gridcolor=BRAND_GRID, zeroline=False, linecolor=BRAND_CHARCOAL, mirror=False)
+    fig.update_yaxes(showgrid=True, gridcolor=BRAND_GRID, zeroline=False, linecolor=BRAND_CHARCOAL, mirror=False)
     return fig
 
 
 def build_env_figure(t: np.ndarray, emg_env_df: pd.DataFrame, selected: list[str]) -> go.Figure:
     fig = go.Figure()
     for c in selected:
-        fig.add_trace(go.Scatter(x=t, y=emg_env_df[c].to_numpy(), mode="lines", name=c))
+        fig.add_trace(
+            go.Scatter(
+                x=t,
+                y=emg_env_df[c].to_numpy(),
+                mode="lines",
+                name=c,
+                line=dict(width=2),
+            )
+        )
     fig.update_layout(
-        height=340,
-        template="plotly_dark",
-        margin=dict(l=20, r=20, t=35, b=25),
+        height=500,
+        template="plotly_white",
+        paper_bgcolor=BRAND_WHITE,
+        plot_bgcolor=BRAND_WHITE,
+        font=dict(color=BRAND_CHARCOAL),
+        margin=dict(l=20, r=20, t=35, b=70),
         xaxis_title="Time (s)",
         yaxis_title="RMS (uV)",
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
     )
+    fig.update_xaxes(showgrid=True, gridcolor=BRAND_GRID, zeroline=False, linecolor=BRAND_CHARCOAL, mirror=False)
+    fig.update_yaxes(showgrid=True, gridcolor=BRAND_GRID, zeroline=False, linecolor=BRAND_CHARCOAL, mirror=False)
     return fig
 
 
@@ -597,12 +1024,11 @@ def phases_table_with_loads(
 ) -> pd.DataFrame:
     """
     Returns a DataFrame with one row per phase, containing the following columns:
-      label, t_start, t_end, min load, p5, max load, p95, total load
+      label, t_start, t_end, min load, AVG load, max load, cumulative load
 
     Definitions:
-      - min/max load: min/max of 'Muscle Load' within [i0, i1), ignoring NaNs
-      - p5/p95: 5th/95th percentile of 'Muscle Load' within [i0, i1), ignoring NaNs
-      - total load: Total Muscle Load within [i0, i1) = sum(sum_all_channels_x_dt) / 100
+      - min/avg/max load: min/mean/max of 'Muscle Load' within [i0, i1), ignoring NaNs
+      - cumulative load: Total Muscle Load within [i0, i1) = sum(sum_all_channels_x_dt) / 100
     """
     rows = []
     for p in phases_t:
@@ -615,21 +1041,19 @@ def phases_table_with_loads(
         # min/max on stable values only
         seg_ml_f = seg_ml[np.isfinite(seg_ml)]
         min_load = float(np.min(seg_ml_f)) if seg_ml_f.size else np.nan
-        p5_load = float(np.percentile(seg_ml_f, 5)) if seg_ml_f.size else np.nan
+        avg_load = float(np.mean(seg_ml_f)) if seg_ml_f.size else np.nan
         max_load = float(np.max(seg_ml_f)) if seg_ml_f.size else np.nan
-        p95_load = float(np.percentile(seg_ml_f, 95)) if seg_ml_f.size else np.nan
 
-        total_load = float(np.sum(seg_contrib) / 100.0) if np.isfinite(seg_contrib).any() else np.nan
+        cumulative_load = float(np.sum(seg_contrib) / 100.0) if np.isfinite(seg_contrib).any() else np.nan
 
         rows.append({
             "label": label,
             "t_start": round(float(p["t0"]), 2),
             "t_end": round(float(p["t1"]), 2),
             "min load": min_load,
-            "p5": p5_load,
+            "AVG load": avg_load,
             "max load": max_load,
-            "p95": p95_load,
-            "total load": total_load,
+            "cumulative load": cumulative_load,
         })
     return pd.DataFrame(rows)
 
@@ -642,13 +1066,74 @@ st.set_page_config(page_title="Myontec EMG Segmentation Analysis Dashboard", lay
 st.markdown(
     """
     <style>
+      :root {
+        --brand-yellow: #FFDD00;
+        --brand-yellow-soft: #FFF3A6;
+        --brand-yellow-pale: #FFF9D6;
+        --brand-black: #121212;
+        --brand-charcoal: #2A2A2A;
+        --brand-white: #FFFDF7;
+        --brand-grid: #E6D98B;
+        --brand-panel: #FFF7CC;
+      }
+      .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background:
+          radial-gradient(circle at top right, rgba(255, 221, 0, 0.18), transparent 26rem),
+          linear-gradient(180deg, #fffef7 0%, #fff9dc 100%);
+        color: var(--brand-charcoal);
+      }
+      [data-testid="stSidebar"] {
+        background:
+          linear-gradient(180deg, rgba(255, 221, 0, 0.28), rgba(255, 255, 255, 0.95));
+        border-right: 1px solid rgba(18, 18, 18, 0.08);
+      }
       .block-container { padding-top: 2.0rem; margin-top: 2rem }
       .titlebar {
-        padding: 14px 16px; border-radius: 16px;
-        background: linear-gradient(90deg, rgba(0,200,255,0.18), rgba(0,255,150,0.12));
-        border: 1px solid rgba(255,255,255,0.08);
+        padding: 18px 20px;
+        border-radius: 18px;
+        background:
+          linear-gradient(120deg, rgba(255, 221, 0, 0.92), rgba(255, 243, 166, 0.88));
+        border: 1px solid rgba(18, 18, 18, 0.10);
+        box-shadow: 0 18px 40px rgba(18, 18, 18, 0.08);
+        color: var(--brand-black);
       }
-      .muted { opacity: 0.75; }
+      .muted { opacity: 0.72; }
+      h1, h2, h3, h4, label, .stMarkdown, [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
+        color: var(--brand-charcoal);
+      }
+      [data-testid="stMetric"] {
+        background: rgba(255, 253, 247, 0.92);
+        border: 1px solid rgba(18, 18, 18, 0.08);
+        border-radius: 16px;
+        padding: 0.75rem 0.9rem;
+        box-shadow: 0 10px 24px rgba(18, 18, 18, 0.05);
+      }
+      [data-testid="stFileUploader"], [data-testid="stNumberInput"], [data-baseweb="select"], .stExpander {
+        background: rgba(255, 253, 247, 0.86);
+        border-radius: 14px;
+      }
+      [data-baseweb="input"] input, [data-baseweb="select"] > div {
+        background: rgba(255, 253, 247, 0.96) !important;
+        color: var(--brand-black) !important;
+        border-color: rgba(18, 18, 18, 0.14) !important;
+      }
+      .stButton > button, .stDownloadButton > button {
+        background: var(--brand-black);
+        color: var(--brand-yellow);
+        border: 1px solid var(--brand-black);
+        border-radius: 999px;
+      }
+      .stButton > button:hover, .stDownloadButton > button:hover {
+        background: #000000;
+        color: var(--brand-white);
+        border-color: #000000;
+      }
+      [data-testid="stDataFrame"] {
+        border: 1px solid rgba(18, 18, 18, 0.08);
+        border-radius: 16px;
+        overflow: hidden;
+        background: rgba(255, 253, 247, 0.96);
+      }
       .js-plotly-plot .plotly .modebar-btn {
         padding: 8px 10px;
       }
@@ -665,7 +1150,7 @@ st.markdown(
     """
     <div class="titlebar">
       <div style="font-size: 20px; font-weight: 700;">EMG Phase Segmentation Dashboard</div>
-      <div class="muted">CSV → EMG envelope → breaks + warmup/aerobic/anaerobic/cooldown</div>
+      <div class="muted">Upload EMG data, review intensity trends, and inspect automated phase segmentation.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -673,22 +1158,32 @@ st.markdown(
 
 st.sidebar.header("Controls")
 fs = st.sidebar.number_input("Sampling rate (Hz)", min_value=1.0, max_value=500.0, value=DEFAULT_FS_HZ, step=1.0)
+exercise_name = st.sidebar.selectbox(
+    "Exercise",
+    options=EXERCISE_OPTIONS,
+    index=0,
+)
 
-uploaded = st.file_uploader("Upload CSV", type=["csv", "txt"])
+uploaded = st.file_uploader("Upload file", type=["csv", "txt", "xlsx", "xls"])
 if not uploaded:
-    st.info("Upload a CSV to view the dashboard.")
+    st.info("Upload a CSV, TXT, or Excel file to view the dashboard.")
     st.stop()
 
 # Load
 try:
-    df = load_myontec_csv_from_bytes(uploaded.getvalue())
+    df = load_myontec_file(uploaded, exercise_name=exercise_name)
 except (ValueError, UnicodeDecodeError) as e:
     st.error(f"Failed to parse file: {e}")
     st.stop()
 
+effective_fs = float(df.attrs.get("sampling_rate_hz", fs))
+if "sampling_rate_hz" in df.attrs:
+    st.sidebar.caption(f"Using sampling rate from file: {effective_fs:.1f} Hz")
+
 # Compute intensity/envelopes
 try:
-    t, emg_env_df, emg_intensity = compute_emg_intensity(df, fs=fs, win_sec=RMS_WIN_SEC)
+    emg_cols = EXERCISE_CHANNELS[exercise_name]
+    t, emg_env_df, emg_intensity = compute_emg_intensity(df, fs=effective_fs, win_sec=RMS_WIN_SEC, emg_cols=emg_cols)
 except (ValueError, KeyError) as e:
     st.error(f"Failed to compute EMG intensity: {e}")
     st.stop()
@@ -697,15 +1192,20 @@ duration_s = float(t[-1]) if len(t) else 0.0
 time_max = float(t[-1] + (1.0 / fs)) if len(t) else 0.0
 
 # Segment phases
-auto_phases, breaks, I_s = segment_phases_from_emg(t, emg_intensity, fs=fs)
+auto_phases, breaks, I_s = segment_phases_from_emg(
+    t,
+    emg_intensity,
+    fs=effective_fs,
+    exercise_name=exercise_name,
+)
 
 # Clip + snap
-auto_phases = clip_phases_around_breaks(auto_phases, breaks, fs=fs, min_phase_sec=MIN_PHASE_SEC)
-auto_phases = snap_phases_to_breaks_strict(auto_phases, breaks, fs=fs, tol_sec=SNAP_TOL_SEC)
+auto_phases = clip_phases_around_breaks(auto_phases, breaks, fs=effective_fs, min_phase_sec=MIN_PHASE_SEC)
+auto_phases = snap_phases_to_breaks_strict(auto_phases, breaks, fs=effective_fs, tol_sec=SNAP_TOL_SEC)
 
 # Attach times
-auto_phases_t = attach_times_to_phases(auto_phases, t, fs=fs)
-breaks_t = attach_times_to_breaks(breaks, t, fs=fs)
+auto_phases_t = attach_times_to_phases(auto_phases, t, fs=effective_fs)
+breaks_t = attach_times_to_breaks(breaks, t, fs=effective_fs)
 
 phase_mode = st.sidebar.radio("Phase boundaries", ["Auto", "Manual"], index=0)
 phases = auto_phases
@@ -747,7 +1247,7 @@ if phase_mode == "Manual":
 
         manual_specs.append({"label": label, "enabled": enabled, "t0": t0, "t1": t1})
 
-    manual_phases, manual_errors = build_manual_phases(t, fs=fs, manual_specs=manual_specs)
+    manual_phases, manual_errors = build_manual_phases(t, fs=effective_fs, manual_specs=manual_specs)
     if manual_errors:
         st.sidebar.error("Manual phase boundaries are invalid.")
         for msg in manual_errors:
@@ -755,7 +1255,7 @@ if phase_mode == "Manual":
     else:
         phases = manual_phases
 
-phases_t = attach_times_to_phases(phases, t, fs=fs)
+phases_t = attach_times_to_phases(phases, t, fs=effective_fs)
 
 # Breaks table 
 def breaks_table(breaks_t: list[dict[str, Any]], fs: float) -> pd.DataFrame:
@@ -777,54 +1277,71 @@ def breaks_table(breaks_t: list[dict[str, Any]], fs: float) -> pd.DataFrame:
 # =============================================================================
 # Compute load signals using the ENVELOPES
 # =============================================================================
-muscle_load, sum_all_channels_x_dt = compute_myontec_load_signals(emg_env_df, fs=fs)
+muscle_load, sum_all_channels_x_dt = compute_myontec_load_signals(emg_env_df, fs=effective_fs)
 
 # Phase table 
-ph_df = phases_table_with_loads(phases_t, muscle_load, sum_all_channels_x_dt, fs=fs)
-br_df = breaks_table(breaks_t, fs=fs)
+ph_df = phases_table_with_loads(phases_t, muscle_load, sum_all_channels_x_dt, fs=effective_fs)
+br_df = breaks_table(breaks_t, fs=effective_fs)
+
+# KPI load metrics excluding detected breaks
+non_break_mask = np.ones(len(muscle_load), dtype=bool)
+for b in breaks_t:
+    i0 = max(0, min(int(b["i0"]), len(non_break_mask)))
+    i1 = max(0, min(int(b["i1"]), len(non_break_mask)))
+    non_break_mask[i0:i1] = False
+
+avg_load_ex_breaks = float(np.nanmean(muscle_load[non_break_mask])) if non_break_mask.any() else np.nan
+cumulative_load_ex_breaks = (
+    float(np.nansum(sum_all_channels_x_dt[non_break_mask])) if non_break_mask.any() else np.nan
+)
 
 # KPI row
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Rows", f"{len(df)}")
-c2.metric("Duration", f"{duration_s:.1f}s")
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Current Date/Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+c2.metric("Duration", _format_hms(duration_s))
 c3.metric("Phases", f"{len(ph_df)}")
-c4.metric("Breaks", f"{len(br_df)}")
-c5.metric("Mean Intensity", f"{float(np.mean(I_s)):.3f}")
+# c4.metric("Average Load", f"{float(np.nanmean(muscle_load)):.3f}")
+c4.metric("Average Load", f"{avg_load_ex_breaks:.3f}")
+c5.metric("Energy Expenditure (kcal)", "XXXX")
+# c6.metric("Cumulative Load (µV·s)", f"{float(np.nansum(sum_all_channels_x_dt)):.3f}")
+c6.metric("Cumulative Load (µV·s)", f"{cumulative_load_ex_breaks:.3f}")
 
-# Layout: plot + tables
-left, right = st.columns([1.65, 1.0], gap="large")
+# Layout: full-width plot, tables below
+fig = build_timeline_figure(
+    t=t,
+    I=emg_intensity,
+    I_s=I_s,
+    phases_t=phases_t,
+    breaks_t=breaks_t,
+    exercise_name=exercise_name,
+)
+st.plotly_chart(fig, use_container_width=True)
 
-with left:
-    fig = build_timeline_figure(t=t, I=emg_intensity, I_s=I_s, phases_t=phases_t, breaks_t=breaks_t)
-    st.plotly_chart(fig, use_container_width=True)
+with st.expander("Per-channel RMS envelopes"):
+    options = list(emg_env_df.columns)
+    default_sel = options
+    selected = st.multiselect("Select channel(s) to display", options=options, default=default_sel)
 
-    with st.expander("Per-channel RMS envelopes"):
-        options = list(emg_env_df.columns)
-        default_sel = options
-        selected = st.multiselect("Select channel(s) to display", options=options, default=default_sel)
+    if not selected:
+        st.info("Select at least one channel to display its RMS envelope.")
+    else:
+        env_fig = build_env_figure(t, emg_env_df, selected)
+        st.plotly_chart(env_fig, use_container_width=True)
 
-        if not selected:
-            st.info("Select at least one channel to display its RMS envelope.")
-        else:
-            env_fig = build_env_figure(t, emg_env_df, selected)
-            st.plotly_chart(env_fig, use_container_width=True)
+st.subheader("Detected Phases (Load Summary)")
+st.dataframe(ph_df, use_container_width=True, height=240)
+st.download_button(
+    "Download phases_loads.csv",
+    data=ph_df.to_csv(index=False).encode("utf-8"),
+    file_name="phases_loads.csv",
+    mime="text/csv",
+)
 
-
-with right:
-    st.subheader("Detected Phases (Load Summary)")
-    st.dataframe(ph_df, use_container_width=True, height=240)
-    st.download_button(
-        "Download phases_loads.csv",
-        data=ph_df.to_csv(index=False).encode("utf-8"),
-        file_name="phases_loads.csv",
-        mime="text/csv",
-    )
-
-    # st.subheader("Detected Breaks / Dropouts")
-    # st.dataframe(br_df, use_container_width=True, height=240)
-    # st.download_button(
-    #     "Download breaks.csv",
-    #     data=br_df.to_csv(index=False).encode("utf-8"),
-    #     file_name="breaks.csv",
-    #     mime="text/csv",
-    # )
+# st.subheader("Detected Breaks / Dropouts")
+# st.dataframe(br_df, use_container_width=True, height=240)
+# st.download_button(
+#     "Download breaks.csv",
+#     data=br_df.to_csv(index=False).encode("utf-8"),
+#     file_name="breaks.csv",
+#     mime="text/csv",
+# )
